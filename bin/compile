@@ -1,41 +1,38 @@
 #!/usr/bin/env bash
-
+# Clone the submodules listed in .gitmodules into the build dir.
+# Heroku API / GitHub Sync builds get a tarball with no .git, so
+# `git submodule update` can't work; this reads .gitmodules directly.
+#
+# Supported per-submodule keys: path, url, branch (optional), revision (optional).
 set -euo pipefail
 
-export BUILD_DIR=$1
-bp_dir=$(cd $(dirname $0); cd ..; pwd)
+BUILD_DIR=$1
+GITMODULES="$BUILD_DIR/.gitmodules"
 
-if [ ! -f "$BUILD_DIR/.gitmodules" ]; then
+if [ ! -f "$GITMODULES" ]; then
   echo "-----> No .gitmodules file found. Skipping."
   exit 0
 fi
 
-# As of Heroku-22, there is no system Ruby installation in the stack image, so if the
-# app doesn't already have the Ruby buildpack set before this one, we have to download
-# our own copy of Ruby to use to run `install_git_submodules.rb`. This Ruby installation
-# will only be available during the compile of this buildpack, and not by subsequent
-# buildpacks (so will not interfere with the real Ruby buildpack, if that's run later).
-if ! command -v ruby &> /dev/null; then
-  echo "-----> Ruby installation not found, temporarily installing Ruby for use by this buildpack"
-  ruby_version="3.3.5"
-  ruby_url="https://heroku-buildpack-ruby.s3.us-east-1.amazonaws.com/${STACK}/amd64/ruby-${ruby_version}.tgz"
-  vendored_ruby_dir="${bp_dir}/vendor/ruby"
-  mkdir -p "${vendored_ruby_dir}"
+# With -z each entry is "submodule.<name>.path\n<path>\0" (names may contain spaces).
+git config -z -f "$GITMODULES" --get-regexp '^submodule\..*\.path$' |
+while IFS=$'\n' read -r -d '' key path; do
+  name=${key#submodule.}
+  name=${name%.path}
+  get() { git config -f "$GITMODULES" --get "submodule.$name.$1" || true; }
 
-  if ! curl --silent --show-error --fail --retry 3 --retry-connrefused --connect-timeout 5 "${ruby_url}" | tar -zxC "${vendored_ruby_dir}"; then
-    echo "     ! Failed to download Ruby from '${ruby_url}'" >&2
-    exit 1
+  url=$(get url)
+  branch=$(get branch)
+  revision=$(get revision)
+  dest="$BUILD_DIR/$path"
+
+  echo "-----> Installing submodule $path${branch:+ ($branch)}"
+  git clone -q --single-branch ${branch:+--branch "$branch"} "$url" "$dest"
+
+  if [ -n "$revision" ]; then
+    echo "       Setting submodule revision to $revision"
+    git -C "$dest" reset -q --hard "$revision"
   fi
 
-  export PATH="${vendored_ruby_dir}/bin:${PATH}"
-
-  echo "-----> Installed Ruby ${ruby_version}"
-fi
-
-export GEM_HOME=$bp_dir/vendor/gems
-export GEM_PATH=$bp_dir/vendor/gems
-
-echo "-----> Installing parseconfig gem"
-gem install 'parseconfig'
-
-ruby $bp_dir/bin/install_git_submodules.rb
+  rm -rf "$dest/.git"
+done
